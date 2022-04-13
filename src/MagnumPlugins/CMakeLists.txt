@@ -87,6 +87,10 @@ if(WITH_GLTFIMPORTER)
     add_subdirectory(GltfImporter)
 endif()
 
+if(WITH_GLTFSCENECONVERTER)
+    add_subdirectory(GltfSceneConverter)
+endif()
+
 if(WITH_HARFBUZZFONT)
     add_subdirectory(HarfBuzzFont)
 endif()

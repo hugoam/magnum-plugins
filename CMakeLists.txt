@@ -66,6 +66,7 @@ cmake_dependent_option(WITH_FREETYPEFONT "Build FreeTypeFont plugin" OFF "NOT WI
 option(WITH_GLSLANGSHADERCONVERTER "Build GlslangShaderConverter plugin" OFF)
 # TODO: make an option() again when CgltfImporter is gone
 cmake_dependent_option(WITH_GLTFIMPORTER "Build GltfImporter plugin" OFF "NOT WITH_CGLTFIMPORTER" ON)
+option(WITH_GLTFSCENECONVERTER "Build GltfSceneConverter plugin" OFF)
 option(WITH_HARFBUZZFONT "Build HarfBuzzFont plugin" OFF)
 option(WITH_ICOIMPORTER "Build IcoImporter plugin" OFF)
 option(WITH_JPEGIMAGECONVERTER "Build JpegImageConverter plugin" OFF)

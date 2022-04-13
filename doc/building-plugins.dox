@@ -363,6 +363,8 @@ By default no plugins are built and you need to select them manually:
 -   `WITH_GLSLANGSHADERCONVERTER` --- Build the @ref ShaderTools::GlslangConverter "GlslangShaderConverter"
     plugin. Depends on [Glslang](https://github.com/KhronosGroup/glslang).
 -   `WITH_GLTFIMPORTER` --- Build the @relativeref{Trade,GltfImporter} plugin.
+-   `WITH_GLTFSCENECONVERTER` --- Build the
+    @relativeref{Trade,GltfSceneConverter} plugin.
 -   `WITH_HARFBUZZFONT` --- Build the @ref Text::HarfBuzzFont "HarfBuzzFont"
     plugin. Enables also building of the @ref Text::FreeTypeFont "FreeTypeFont"
     plugin. Depends on [HarfBuzz](http://www.freedesktop.org/wiki/Software/HarfBuzz).
