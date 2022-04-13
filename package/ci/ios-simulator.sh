@@ -36,7 +36,7 @@ set -o pipefail && cmake --build . --config Release --target install | xcbeautif
 cd ../..
 
 # Crosscompile Magnum
-git clone --depth 1 https://github.com/mosra/magnum.git
+git clone --depth 1 --branch sceneconverter https://github.com/mosra/magnum.git
 cd magnum
 mkdir build-ios && cd build-ios
 cmake .. \
