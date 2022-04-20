@@ -246,6 +246,9 @@ class MAGNUM_GLTFSCENECONVERTER_EXPORT GltfSceneConverter: public AbstractSceneC
         MAGNUM_GLTFSCENECONVERTER_LOCAL Containers::Optional<Containers::Array<char>> doEndData() override;
         MAGNUM_GLTFSCENECONVERTER_LOCAL void doAbort() override;
 
+        MAGNUM_GLTFSCENECONVERTER_LOCAL void doSetObjectName(UnsignedLong object, Containers::StringView name) override;
+        MAGNUM_GLTFSCENECONVERTER_LOCAL bool doAdd(const UnsignedInt id, const SceneData& scene, Containers::StringView name) override;
+
         MAGNUM_GLTFSCENECONVERTER_LOCAL void doSetMeshAttributeName(UnsignedShort attribute, Containers::StringView name) override;
         MAGNUM_GLTFSCENECONVERTER_LOCAL bool doAdd(const UnsignedInt id, const MeshData& mesh, Containers::StringView name) override;
 

@@ -25,6 +25,7 @@
 
 #include "GltfSceneConverter.h"
 
+#include <Corrade/Containers/ArrayTuple.h>
 #include <Corrade/Containers/ArrayViewStl.h> /** @todo drop once Configuration is STL-free */
 #include <Corrade/Containers/GrowableArray.h>
 #include <Corrade/Containers/Pair.h>
@@ -35,8 +36,11 @@
 #include <Corrade/Utility/JsonWriter.h>
 #include <Corrade/Utility/Path.h>
 #include <Corrade/Utility/String.h>
+#include <Magnum/Math/Matrix4.h>
+#include <Magnum/Math/Quaternion.h>
 #include <Magnum/Trade/ArrayAllocator.h>
 #include <Magnum/Trade/MeshData.h>
+#include <Magnum/Trade/SceneData.h>
 
 #include "MagnumPlugins/GltfImporter/Gltf.h"
 
@@ -55,6 +59,8 @@ struct GltfSceneConverter::State {
     Containers::Optional<Containers::StringView> filename;
     /* Custom mesh attribute names */
     Containers::Array<Containers::Pair<UnsignedShort, Containers::String>> customMeshAttributes;
+    /* Object names */
+    Containers::Array<Containers::String> objectNames;
 
     /* Output format. Defaults for a binary output. */
     bool binary = true;
@@ -68,6 +74,8 @@ struct GltfSceneConverter::State {
     Utility::JsonWriter gltfBufferViews;
     Utility::JsonWriter gltfAccessors;
     Utility::JsonWriter gltfMeshes;
+    Utility::JsonWriter gltfNodes;
+    Utility::JsonWriter gltfScenes;
 
     Containers::Array<char> buffer;
 };
@@ -80,7 +88,8 @@ GltfSceneConverter::~GltfSceneConverter() = default;
 
 SceneConverterFeatures GltfSceneConverter::doFeatures() const {
     return SceneConverterFeature::ConvertMultipleToData|
-           SceneConverterFeature::AddMeshes;
+           SceneConverterFeature::AddMeshes|
+           SceneConverterFeature::AddScenes;
 }
 
 void GltfSceneConverter::doBeginFile(const Containers::StringView filename) {
@@ -122,7 +131,9 @@ void GltfSceneConverter::doBeginData() {
             &_state->gltfBuffers,
             &_state->gltfBufferViews,
             &_state->gltfAccessors,
-            &_state->gltfMeshes
+            &_state->gltfMeshes,
+            &_state->gltfNodes,
+            &_state->gltfScenes
         })
             *writer = Utility::JsonWriter{_state->jsonOptions, _state->jsonIndentation, _state->jsonIndentation*1};
     }
@@ -213,6 +224,16 @@ Containers::Optional<Containers::Array<char>> GltfSceneConverter::doEndData() {
     if(!_state->gltfMeshes.isEmpty())
         json.writeKey("meshes").writeJson(_state->gltfMeshes.endArray().toString());
 
+    /* Nodes and scenes, those got written all at once in
+       doAdd(const SceneData&) so no need to close anything */
+    if(!_state->gltfNodes.isEmpty())
+        json.writeKey("nodes").writeJson(_state->gltfNodes.toString());
+    if(!_state->gltfScenes.isEmpty()) {
+        json.writeKey("scenes").writeJson(_state->gltfScenes.toString());
+        /* Currently there's at most one scene, so make it a default */
+        json.writeKey("scene").write(0);
+    }
+
     /* Done! */
     json.endObject();
 
@@ -275,6 +296,337 @@ Containers::Optional<Containers::Array<char>> GltfSceneConverter::doEndData() {
 
 void GltfSceneConverter::doAbort() {
     _state = {};
+}
+
+void GltfSceneConverter::doSetObjectName(const UnsignedLong object, const Containers::StringView name) {
+    if(_state->objectNames.size() <= object)
+        arrayResize(_state->objectNames, object + 1);
+    _state->objectNames[object] = Containers::String::nullTerminatedGlobalView(name);
+}
+
+bool GltfSceneConverter::doAdd(const UnsignedInt id, const SceneData& scene, const Containers::StringView name) {
+    if(!scene.is3D()) {
+        Error{} << "Trade::GltfSceneConverter::add(): expected a 3D scene";
+        return {};
+    }
+
+    /* Calculate count of field assignments for each object. Initially shifted
+       by two values, `objectFieldOffsets[i + 2]` is the count of fields for
+       object `i`. */
+    Containers::Array<std::size_t> objectFieldOffsets{ValueInit, std::size_t(scene.mappingBound() + 2)};
+    Containers::Array<UnsignedInt> mappingStorage{NoInit, std::size_t(scene.mappingBound())};
+    for(UnsignedInt i = 0, iMax = scene.fieldCount(); i != iMax; ++i) {
+        /* Skip fields that are treated differently */
+        if(
+            /* Parents are converted to a child list instead -- a presence of
+               a parent field doesn't say anything about given object having
+               any children */
+            scene.fieldName(i) == SceneField::Parent ||
+            /* Materials are tied to the Mesh field -- if Mesh exists,
+               Materials have the exact same mapping, thus there's no point in
+               counting them separately */
+            scene.fieldName(i) == SceneField::MeshMaterial
+        ) continue;
+
+        const std::size_t fieldSize = scene.fieldSize(i);
+        const Containers::ArrayView<UnsignedInt> mapping = mappingStorage.prefix(fieldSize);
+        scene.mappingInto(i, mapping);
+        for(std::size_t j = 0, jMax = fieldSize; j != jMax; ++j) {
+            if(mapping[j] >= scene.mappingBound()) {
+                Error{} << "Trade::GltfSceneConverter::add(): scene field" << i << "mapping" << mapping[j] << "out of bounds for" << scene.mappingBound() << "objects";
+                return {};
+            }
+
+            ++objectFieldOffsets[mapping[j] + 2];
+        }
+    }
+
+    /* Turn that into an offset array. This makes it shifted by just one value,
+       so `objectFieldOffsets[i + 2] - objectFieldOffsets[i + 1]` is the count
+       of fields for object `i`. */
+    std::size_t totalFieldCount = 0;
+    for(std::size_t& i: objectFieldOffsets) {
+        const std::size_t count = i;
+        i += totalFieldCount;
+        totalFieldCount += count;
+    }
+
+    /* Arrays containing field IDs and offsets. This makes `objectFieldOffsets`
+       finally unshifted, so `fieldIds[objectFieldOffsets[i]]` to
+       `fieldIds[objectFieldOffsets[i + 1]]` contains field IDs for object `i`,
+       same with `offsets`. */
+    Containers::Array<UnsignedInt> fieldIds{NoInit, totalFieldCount};
+    Containers::Array<std::size_t> fieldOffsets{NoInit, totalFieldCount};
+    for(UnsignedInt i = 0, iMax = scene.fieldCount(); i != iMax; ++i) {
+        /* Same as in the previous loop */
+        if(scene.fieldName(i) == SceneField::Parent ||
+           scene.fieldName(i) == SceneField::MeshMaterial) continue;
+
+        const std::size_t fieldSize = scene.fieldSize(i);
+        const Containers::ArrayView<UnsignedInt> mapping = mappingStorage.prefix(fieldSize);
+        scene.mappingInto(i, mapping); // TODO do this just once?
+        for(std::size_t j = 0; j != fieldSize; ++j) {
+            std::size_t& objectFieldOffset = objectFieldOffsets[mapping[j] + 1];
+            fieldIds[objectFieldOffset] = i;
+            fieldOffsets[objectFieldOffset] = j;
+            ++objectFieldOffset;
+        }
+    }
+    CORRADE_INTERNAL_ASSERT(
+        objectFieldOffsets[0] == 0 &&
+        objectFieldOffsets[objectFieldOffsets.size() - 1] == totalFieldCount &&
+        objectFieldOffsets[objectFieldOffsets.size() - 2] == totalFieldCount);
+
+    /* Retrieve sizes of builtin fields in known types */
+    std::size_t parentCount = 0;
+    // TODO how to represent parent-less nodes? or just add them w/o
+    //  referencing from a scene? well that wouldn't be *a scene*, would it
+    // TODO should ignore parent-less nodes (needs a bitfield, again) ... tho
+    //  those are what is used for an "instance-less" scene, sigh, what to do?
+    //  WHAT TO DO? (or just export them but then during import put them into a
+    //  dedicated "leftover" scene that won't have a parent field?)
+    std::size_t transformationCount = 0;
+    std::size_t trsCount = 0;
+    bool hasTranslation = false;
+    bool hasRotation = false;
+    bool hasScaling = false;
+    std::size_t meshMaterialCount = 0;
+    bool hasMaterial = false;
+    std::size_t lightCount = 0;
+    std::size_t cameraCount = 0;
+    std::size_t skinCount = 0;
+    for(UnsignedInt i = 0; i != scene.fieldCount(); ++i) {
+        const std::size_t size = scene.fieldSize(i);
+        switch(scene.fieldName(i)) {
+            case SceneField::Parent:
+                parentCount = size;
+                continue;
+            case SceneField::Transformation:
+                transformationCount = size;
+                continue;
+            case SceneField::Translation:
+                hasTranslation = true;
+                trsCount = size;
+                continue;
+            case SceneField::Rotation:
+                hasRotation = true;
+                trsCount = size;
+                continue;
+            case SceneField::Scaling:
+                hasScaling = true;
+                trsCount = size;
+                continue;
+            case SceneField::Mesh:
+                meshMaterialCount = size;
+                continue;
+            case SceneField::MeshMaterial:
+                /* Used only in combination with a mesh, alone it doesn't
+                   contribute to meshMaterialCount */
+                hasMaterial = true;
+                continue;
+            case SceneField::Light:
+                lightCount = size;
+                continue;
+            case SceneField::Camera:
+                cameraCount = size;
+                continue;
+            case SceneField::Skin:
+                skinCount = size;
+                continue;
+
+            /* ImporterState is ignored, it makes no sense to save a pointer
+               value */
+            case SceneField::ImporterState:
+                continue;
+        }
+
+        /* Custom fields get unpacked to a generic type */
+        // TODO
+    }
+
+    /* Allocate and populate them */
+    Containers::ArrayView<Int> parents;
+    Containers::ArrayView<UnsignedInt> childOffsets;
+    Containers::ArrayView<UnsignedInt> children;
+    Containers::ArrayView<Matrix4> transformations;
+    Containers::ArrayView<Vector3> translations;
+    Containers::ArrayView<Quaternion> rotations;
+    Containers::ArrayView<Vector3> scalings;
+    Containers::ArrayView<UnsignedInt> meshes;
+    Containers::ArrayView<Int> meshMaterials;
+    Containers::ArrayView<UnsignedInt> lights;
+    Containers::ArrayView<UnsignedInt> cameras;
+    Containers::ArrayView<UnsignedInt> skins;
+    Containers::ArrayTuple fieldStorage{
+        {NoInit, parentCount, parents},
+        /* The first element is 0, the second is root object count */
+        {ValueInit, scene.mappingBound() + 2, childOffsets},
+        {NoInit, parentCount, children},
+        {NoInit, transformationCount, transformations},
+        {NoInit, hasTranslation ? trsCount : 0, translations},
+        {NoInit, hasRotation ? trsCount : 0, rotations},
+        {NoInit, hasScaling ? trsCount : 0, scalings},
+        {NoInit, meshMaterialCount, meshes},
+        {NoInit, hasMaterial ? meshMaterialCount : 0, meshMaterials},
+        {NoInit, lightCount, lights},
+        {NoInit, cameraCount, cameras},
+        {NoInit, skinCount, skins}
+    };
+
+    /* Parent pointers, convert that to a child list */
+    if(parentCount) {
+        const Containers::ArrayView<UnsignedInt> parentMapping = mappingStorage.prefix(parentCount);
+        scene.parentsInto(parentMapping, parents);
+
+        /* Calculate count of children for every object. Initially shifted
+           by two values, `childOffsets[i + 2]` is the count of children for
+           object `i`, `childOffsets[1]` is the count of root objects,
+           `childOffsets[0]` is 0. */
+        for(std::size_t i = 0; i != parents.size(); ++i) {
+            Int parent = parents[i];
+            if(parent != -1 && UnsignedInt(parent) >= scene.mappingBound()) {
+                Error{} << "Trade::GltfSceneConverter::add(): scene parent reference" << parent << "out of bounds for" << scene.mappingBound() << "objects";
+                return {};
+            }
+
+            ++childOffsets[parent + 2];
+        }
+
+        // TODO cycle detection (the same object multiple times in the mapping)
+        //  needs a bitfield
+
+        /* Turn that into an offset array. This makes it shifted by just one
+           value, so `childOffsets[i + 2] - childOffsets[i + 1]` is the count
+           of children for object `i`; `childOffsets[1]` is the count of
+           root objects, `childOffsets[0]` is 0. */
+        std::size_t offset = 0;
+        for(UnsignedInt& i: childOffsets) {
+            const std::size_t count = i;
+            i += offset;
+            offset += count;
+        }
+        CORRADE_INTERNAL_ASSERT(offset == parents.size());
+
+        /* Populate the child array. This makes `childOffsets` finally
+           unshifted, so `children[childOffsets[i]]` to
+           `children[childOffsets[i + 1]]` contains children of object `i`;
+           `children[0]` until `childOffsets[i]` contains root objects. */
+        for(std::size_t i = 0; i != parents.size(); ++i) {
+            const UnsignedInt object = parentMapping[i];
+            if(object >= scene.mappingBound()) {
+                Error{} << "Trade::GltfSceneConverter::add(): scene parent mapping" << object << "out of bounds for" << scene.mappingBound() << "objects";
+                return {};
+            }
+
+            children[childOffsets[parents[i] + 1]++] = object;
+        }
+        CORRADE_INTERNAL_ASSERT(
+            childOffsets[childOffsets.size() - 1] == parentCount &&
+            childOffsets[childOffsets.size() - 2] == parentCount);
+    }
+
+    if(transformationCount)
+        scene.transformations3DInto(nullptr, transformations);
+    if(trsCount)
+        scene.translationsRotationsScalings3DInto(nullptr,
+            hasTranslation ? translations : nullptr,
+            hasRotation ? rotations : nullptr,
+            hasScaling ? scalings : nullptr);
+    if(meshMaterialCount)
+        scene.meshesMaterialsInto(nullptr, meshes,
+            hasMaterial ? meshMaterials : nullptr);
+    if(lightCount)
+        scene.lightsInto(nullptr, lights);
+    if(cameraCount)
+        scene.camerasInto(nullptr, cameras);
+    if(skinCount)
+        scene.skinsInto(nullptr, skins);
+
+    /* Go object by object and consume the fields, populating the glTF node
+       array */
+    // TODO gracefully fail if adding more than one scene
+    CORRADE_INTERNAL_ASSERT(_state->gltfNodes.isEmpty());
+    Containers::ScopeGuard gltfNodes = _state->gltfNodes.beginArrayScope();
+    for(UnsignedLong j = 0; j != scene.mappingBound(); ++j) {
+        Containers::ScopeGuard gltfNode = _state->gltfNodes.beginObjectScope();
+
+        /* Write the children array, if there's any */
+        if(childOffsets[j + 1] - childOffsets[j]) {
+            _state->gltfNodes.writeKey("children").writeArray(children.slice(childOffsets[j], childOffsets[j + 1]));
+        }
+
+        SceneField previous{};
+        for(std::size_t i = objectFieldOffsets[j], iMax = objectFieldOffsets[j + 1]; i != iMax; ++i) {
+            const UnsignedInt id = fieldIds[i];
+            const std::size_t offset = fieldOffsets[i];
+            const SceneField name = scene.fieldName(id);
+            if(name == previous) {
+                // TODO for custom fields it could make sense to put them into arrays, but a multi-field should be detected in advance
+                // TODO needs a bitfield
+                Warning{} << "Trade::GltfSceneConverter::add(): ignoring duplicate field" << previous << "for node" << j;
+                continue;
+            }
+
+            previous = name;
+
+            if(name == SceneField::Transformation) {
+                // TODO ignore if TRS is present, assume these are sufficient?
+                // TODO needs a bitfield to know which objects have transform,
+                //  which have TRS, and then writing transform for only those
+                //  that are left in transform&~trs
+                // TODO When a node is targeted for animation (referenced by an animation.channel.target), matrix MUST NOT be present.
+                _state->gltfNodes.writeKey("matrix").writeArray(transformations[offset].data(), 4);
+            } else if(name == SceneField::Translation) {
+                if(translations[offset] != Vector3{})
+                    _state->gltfNodes.writeKey("translation").writeArray(translations[offset].data());
+            } else if(name == SceneField::Rotation) {
+                if(rotations[offset] != Quaternion{})
+                    /* glTF also uses the XYZW order */
+                    _state->gltfNodes.writeKey("rotation").writeArray(rotations[offset].data());
+            } else if(name == SceneField::Scaling) {
+                if(translations[offset] != Vector3{1.0f})
+                    _state->gltfNodes.writeKey("scale").writeArray(scalings[offset].data());
+            } else if(name == SceneField::Mesh) {
+                _state->gltfNodes.writeKey("mesh").write(meshes[offset]);
+                // TODO material
+                // TODO ffs!!! how dafuq, delay mesh adding altogether because F
+                //  array of Mesh, which is: prim, attrib key/value list, indices
+                // TODO ffs! what if same mesh different material?! F
+            } else if(name == SceneField::Light) {
+                _state->gltfNodes.writeKey("light").write(lights[offset]);
+            } else if(name == SceneField::Camera) {
+                _state->gltfNodes.writeKey("camera").write(cameras[offset]);
+            } else if(name == SceneField::Skin) {
+                _state->gltfNodes.writeKey("skin").write(skins[offset]);
+            } else if(name == SceneField::Parent ||
+                      name == SceneField::MeshMaterial) {
+                /* Skipped when counting the fields, thus shouldn't appear
+                   here */
+                CORRADE_INTERNAL_ASSERT_UNREACHABLE();
+            } else {
+                // TODO hmmmmmmmmmmmmmmmmmmmmmmmmmmm
+            }
+        }
+
+        if(_state->objectNames.size() > j && _state->objectNames[j])
+            _state->gltfNodes.writeKey("name").write(_state->objectNames[j]);
+    }
+
+    /* Scene object referencing the root children */
+    CORRADE_INTERNAL_ASSERT(_state->gltfScenes.isEmpty());
+    Containers::ScopeGuard gltfScenes = _state->gltfScenes.beginArrayScope();
+    CORRADE_INTERNAL_ASSERT(_state->gltfScenes.currentArraySize() == id);
+    Containers::ScopeGuard gltfScene = _state->gltfScenes.beginObjectScope();
+    if(childOffsets[0]) {
+        // TODO what if there are no root objects? happens when a SceneData has
+        //  no parent info, e.g.
+        _state->gltfScenes.writeKey("nodes").writeArray(children.prefix(childOffsets[0]));
+    }
+
+    if(name)
+        _state->gltfScenes.writeKey("name").write(name);
+
+    return true;
 }
 
 void GltfSceneConverter::doSetMeshAttributeName(const UnsignedShort attribute, Containers::StringView name) {
