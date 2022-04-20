@@ -65,6 +65,7 @@ struct GltfSceneConverterTest: TestSuite::Tester {
     void addMeshCustomAttributeNoName();
     void addMeshCustomObjectIdAttributeName();
     void addMeshInvalid();
+    // TODO multiple meshes, mix indexed and not
 
     void requiredExtensionsAddedAlready();
 

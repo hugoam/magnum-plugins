@@ -229,6 +229,10 @@ Containers::Optional<Containers::Array<char>> GltfSceneConverter::doEndData() {
             (_state->buffer.isEmpty() ? 0 :
                 8 + _state->buffer.size()); /* BIN chunk + header */
         Containers::arrayReserve<ArrayAllocator>(out, totalSize);
+        /** @todo check for JSON and buffer sizes >4GB and fail, suggest using
+            external buffers / "text" glTF */
+        // TODO option to not store the buffer inside a glb for this very
+        //  reason?
 
         /* glTF header */
         Containers::arrayAppend<ArrayAllocator>(out,
