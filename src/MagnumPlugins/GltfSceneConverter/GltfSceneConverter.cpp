@@ -38,10 +38,12 @@
 #include <Corrade/Utility/JsonWriter.h>
 #include <Corrade/Utility/Path.h>
 #include <Corrade/Utility/String.h>
+#include <Magnum/Math/Color.h>
 #include <Magnum/Math/Matrix4.h>
 #include <Magnum/Math/PackingBatch.h>
 #include <Magnum/Math/Quaternion.h>
 #include <Magnum/Trade/ArrayAllocator.h>
+#include <Magnum/Trade/MaterialData.h>
 #include <Magnum/Trade/MeshData.h>
 #include <Magnum/Trade/SceneData.h>
 
@@ -81,6 +83,7 @@ struct GltfSceneConverter::State {
     Utility::JsonWriter gltfMeshes;
     Utility::JsonWriter gltfNodes;
     Utility::JsonWriter gltfScenes;
+    Utility::JsonWriter gltfMaterials;
 
     Containers::Array<char> buffer;
 };
@@ -94,6 +97,7 @@ GltfSceneConverter::~GltfSceneConverter() = default;
 SceneConverterFeatures GltfSceneConverter::doFeatures() const {
     return SceneConverterFeature::ConvertMultipleToData|
            SceneConverterFeature::AddMeshes|
+           SceneConverterFeature::AddMaterials|
            SceneConverterFeature::AddScenes;
 }
 
@@ -138,7 +142,8 @@ void GltfSceneConverter::doBeginData() {
             &_state->gltfAccessors,
             &_state->gltfMeshes,
             &_state->gltfNodes,
-            &_state->gltfScenes
+            &_state->gltfScenes,
+            &_state->gltfMaterials
         })
             *writer = Utility::JsonWriter{_state->jsonOptions, _state->jsonIndentation, _state->jsonIndentation*1};
     }
@@ -226,6 +231,8 @@ Containers::Optional<Containers::Array<char>> GltfSceneConverter::doEndData() {
         json.writeKey("bufferViews").writeJson(_state->gltfBufferViews.endArray().toString());
     if(!_state->gltfAccessors.isEmpty())
         json.writeKey("accessors").writeJson(_state->gltfAccessors.endArray().toString());
+    if(!_state->gltfMaterials.isEmpty())
+        json.writeKey("materials").writeJson(_state->gltfMaterials.endArray().toString());
     if(!_state->gltfMeshes.isEmpty())
         json.writeKey("meshes").writeJson(_state->gltfMeshes.endArray().toString());
 
@@ -1207,6 +1214,44 @@ bool GltfSceneConverter::doAdd(const UnsignedInt id, const MeshData& mesh, const
 
     if(name)
         _state->gltfMeshes.writeKey("name").write(name);
+
+    return true;
+}
+
+bool GltfSceneConverter::doAdd(UnsignedInt, const MaterialData& material, const Containers::StringView name) {
+    /* If this is a first material, open the materials array */
+    if(_state->gltfMaterials.isEmpty())
+        _state->gltfMaterials.beginArray();
+
+    Containers::ScopeGuard gltfMaterial = _state->gltfMaterials.beginObjectScope();
+
+    // TODO this should instead go in a sorted sequence attrib-by-attrib and
+    //  write each where appropriate (yes, having several JsonWriters open);
+    //  warning about unhandled builtin attribs and unrepresentable ones
+    _state->gltfMaterials.writeKey("pbrMetallicRoughness"_s);
+    {
+        Containers::ScopeGuard gltfMaterialPbrMetallicRoughness = _state->gltfMaterials.beginObjectScope();
+        // TODO ffs where's findAttributeId()?!
+        if(material.hasAttribute(MaterialAttribute::BaseColor)) {
+            _state->gltfMaterials.writeKey("baseColorFactor"_s).writeArray(material.attribute<Color4>(MaterialAttribute::BaseColor).data());
+        }
+        // TODO ffs where's findAttributeId()?!
+        if(material.hasAttribute(MaterialAttribute::BaseColorTexture)) {
+            _state->gltfMaterials.writeKey("baseColorTexture"_s)
+                .beginObject()
+                    .writeKey("index"_s).write(material.attribute<UnsignedInt>(MaterialAttribute::BaseColorTexture))
+                .endObject();
+        }
+    }
+
+    if(material.types() & MaterialType::Flat)
+        _state->gltfMaterials.writeKey("extensions"_s)
+            .beginObject()
+                .writeKey("KHR_materials_unlit"_s).beginObject().endObject()
+            .endObject();
+
+    if(name)
+        _state->gltfMaterials.writeKey("name").write(name);
 
     return true;
 }
