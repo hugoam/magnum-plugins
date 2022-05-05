@@ -25,18 +25,21 @@
 
 #include "GltfSceneConverter.h"
 
+#include <unordered_map>
 #include <Corrade/Containers/ArrayTuple.h>
 #include <Corrade/Containers/ArrayViewStl.h> /** @todo drop once Configuration is STL-free */
 #include <Corrade/Containers/GrowableArray.h>
 #include <Corrade/Containers/Pair.h>
 #include <Corrade/Containers/Triple.h>
 #include <Corrade/Containers/ScopeGuard.h>
+#include <Corrade/Utility/Algorithms.h>
 #include <Corrade/Utility/ConfigurationGroup.h>
 #include <Corrade/Utility/Format.h>
 #include <Corrade/Utility/JsonWriter.h>
 #include <Corrade/Utility/Path.h>
 #include <Corrade/Utility/String.h>
 #include <Magnum/Math/Matrix4.h>
+#include <Magnum/Math/PackingBatch.h>
 #include <Magnum/Math/Quaternion.h>
 #include <Magnum/Trade/ArrayAllocator.h>
 #include <Magnum/Trade/MeshData.h>
@@ -61,6 +64,8 @@ struct GltfSceneConverter::State {
     Containers::Array<Containers::Pair<UnsignedShort, Containers::String>> customMeshAttributes;
     /* Object names */
     Containers::Array<Containers::String> objectNames;
+    /* Scene field names */
+    std::unordered_map<UnsignedInt, Containers::String> sceneFieldNames;
 
     /* Output format. Defaults for a binary output. */
     bool binary = true;
@@ -304,6 +309,10 @@ void GltfSceneConverter::doSetObjectName(const UnsignedLong object, const Contai
     _state->objectNames[object] = Containers::String::nullTerminatedGlobalView(name);
 }
 
+void GltfSceneConverter::doSetSceneFieldName(const UnsignedInt field, const Containers::StringView name) {
+    _state->sceneFieldNames[field] = Containers::String::nullTerminatedGlobalView(name);
+}
+
 bool GltfSceneConverter::doAdd(const UnsignedInt id, const SceneData& scene, const Containers::StringView name) {
     if(!scene.is3D()) {
         Error{} << "Trade::GltfSceneConverter::add(): expected a 3D scene";
@@ -316,17 +325,41 @@ bool GltfSceneConverter::doAdd(const UnsignedInt id, const SceneData& scene, con
     Containers::Array<std::size_t> objectFieldOffsets{ValueInit, std::size_t(scene.mappingBound() + 2)};
     Containers::Array<UnsignedInt> mappingStorage{NoInit, std::size_t(scene.mappingBound())};
     for(UnsignedInt i = 0, iMax = scene.fieldCount(); i != iMax; ++i) {
+        const SceneField name = scene.fieldName(i);
+
         /* Skip fields that are treated differently */
         if(
             /* Parents are converted to a child list instead -- a presence of
                a parent field doesn't say anything about given object having
                any children */
-            scene.fieldName(i) == SceneField::Parent ||
+            name == SceneField::Parent ||
             /* Materials are tied to the Mesh field -- if Mesh exists,
                Materials have the exact same mapping, thus there's no point in
                counting them separately */
-            scene.fieldName(i) == SceneField::MeshMaterial
+            name == SceneField::MeshMaterial
         ) continue;
+
+        /* Custom fields */
+        if(isSceneFieldCustom(name)) {
+            /* Skip ones for which we don't have a name */
+            const auto found = _state->sceneFieldNames.find(sceneFieldCustom(name));
+            if(found == _state->sceneFieldNames.end()) {
+                Warning{} << "Trade::GltfSceneConverter::add(): custom scene field" << sceneFieldCustom(name) << "has no name assigned, skipping";
+                continue;
+            }
+
+            /* Allow only scalar numbers for now */
+            // TODO for vectors we'd have to use += size instead of
+            //  ++objectFieldOffsets below, have different output arrays for
+            //  numbers, bools, enums and strings, ... Too much trouble ATM.
+            const SceneFieldType type = scene.fieldType(i);
+            if(type != SceneFieldType::UnsignedInt &&
+               type != SceneFieldType::Int &&
+               type != SceneFieldType::Float) {
+                Warning{} << "Trade::GltfSceneConverter::add(): custom field" << found->second << "has unsupported type" << type << Debug::nospace << ", skipping";
+                continue;
+            }
+        }
 
         const std::size_t fieldSize = scene.fieldSize(i);
         const Containers::ArrayView<UnsignedInt> mapping = mappingStorage.prefix(fieldSize);
@@ -357,10 +390,27 @@ bool GltfSceneConverter::doAdd(const UnsignedInt id, const SceneData& scene, con
        same with `offsets`. */
     Containers::Array<UnsignedInt> fieldIds{NoInit, totalFieldCount};
     Containers::Array<std::size_t> fieldOffsets{NoInit, totalFieldCount};
+    std::size_t customFieldOffset = 0;
     for(UnsignedInt i = 0, iMax = scene.fieldCount(); i != iMax; ++i) {
         /* Same as in the previous loop */
+        // TODO use a bitfield ffs, too error prone
         if(scene.fieldName(i) == SceneField::Parent ||
            scene.fieldName(i) == SceneField::MeshMaterial) continue;
+        const SceneField name = scene.fieldName(i);
+        if(isSceneFieldCustom(name)) {
+            const SceneFieldType type = scene.fieldType(i);
+            if(_state->sceneFieldNames.find(sceneFieldCustom(name)) == _state->sceneFieldNames.end() ||
+               (type != SceneFieldType::UnsignedInt &&
+                type != SceneFieldType::Int &&
+                type != SceneFieldType::Float)) continue;
+        }
+
+        /* As we put all custom fields into a single float/int array, the
+           offset needs to also include sizes of all previous custom fields
+           already written */
+        // TODO when we support more than just numeric fields, this probably
+        //  needs to branch on field type
+        const std::size_t baseOffset = isSceneFieldCustom(name) ? customFieldOffset : 0;
 
         const std::size_t fieldSize = scene.fieldSize(i);
         const Containers::ArrayView<UnsignedInt> mapping = mappingStorage.prefix(fieldSize);
@@ -368,9 +418,12 @@ bool GltfSceneConverter::doAdd(const UnsignedInt id, const SceneData& scene, con
         for(std::size_t j = 0; j != fieldSize; ++j) {
             std::size_t& objectFieldOffset = objectFieldOffsets[mapping[j] + 1];
             fieldIds[objectFieldOffset] = i;
-            fieldOffsets[objectFieldOffset] = j;
+            fieldOffsets[objectFieldOffset] = baseOffset + j;
             ++objectFieldOffset;
         }
+
+        if(isSceneFieldCustom(name))
+            customFieldOffset += fieldSize;
     }
     CORRADE_INTERNAL_ASSERT(
         objectFieldOffsets[0] == 0 &&
@@ -439,9 +492,6 @@ bool GltfSceneConverter::doAdd(const UnsignedInt id, const SceneData& scene, con
             case SceneField::ImporterState:
                 continue;
         }
-
-        /* Custom fields get unpacked to a generic type */
-        // TODO
     }
 
     /* Allocate and populate them */
@@ -457,6 +507,7 @@ bool GltfSceneConverter::doAdd(const UnsignedInt id, const SceneData& scene, con
     Containers::ArrayView<UnsignedInt> lights;
     Containers::ArrayView<UnsignedInt> cameras;
     Containers::ArrayView<UnsignedInt> skins;
+    Containers::ArrayView<Float> customFields;
     Containers::ArrayTuple fieldStorage{
         {NoInit, parentCount, parents},
         /* The first element is 0, the second is root object count */
@@ -470,7 +521,8 @@ bool GltfSceneConverter::doAdd(const UnsignedInt id, const SceneData& scene, con
         {NoInit, hasMaterial ? meshMaterialCount : 0, meshMaterials},
         {NoInit, lightCount, lights},
         {NoInit, cameraCount, cameras},
-        {NoInit, skinCount, skins}
+        {NoInit, skinCount, skins},
+        {NoInit, customFieldOffset, customFields}
     };
 
     /* Parent pointers, convert that to a child list */
@@ -525,6 +577,7 @@ bool GltfSceneConverter::doAdd(const UnsignedInt id, const SceneData& scene, con
             childOffsets[childOffsets.size() - 2] == parentCount);
     }
 
+    /* Other builtin fields */
     if(transformationCount)
         scene.transformations3DInto(nullptr, transformations);
     if(trsCount)
@@ -542,6 +595,40 @@ bool GltfSceneConverter::doAdd(const UnsignedInt id, const SceneData& scene, con
     if(skinCount)
         scene.skinsInto(nullptr, skins);
 
+    /* Custom fields */
+    {
+        std::size_t offset = 0;
+        for(std::size_t i = 0; i != scene.fieldCount(); ++i) {
+            // TODO USE A BITFIELD FFS, third time copying this crap
+            const SceneField name = scene.fieldName(i);
+            if(!isSceneFieldCustom(name) ||
+            _state->sceneFieldNames.find(sceneFieldCustom(name)) == _state->sceneFieldNames.end()) continue;
+            const SceneFieldType type = scene.fieldType(i);
+            if(_state->sceneFieldNames.find(sceneFieldCustom(name)) == _state->sceneFieldNames.end() ||
+               (type != SceneFieldType::UnsignedInt &&
+                type != SceneFieldType::Int &&
+                type != SceneFieldType::Float)) continue;
+
+            const std::size_t size = scene.fieldSize(i);
+            const Containers::ArrayView<Float> dst = customFields.slice(offset, offset + size);
+            // TODO this won't work for more than 23 bits of precision, use
+            //  ints directly FFS
+            if(type == SceneFieldType::UnsignedInt) Math::castInto(
+                Containers::arrayCast<2, const UnsignedInt>(scene.field<UnsignedInt>(i)),
+                Containers::arrayCast<2, Float>(dst));
+            else if(type == SceneFieldType::Int) Math::castInto(
+                Containers::arrayCast<2, const Int>(scene.field<Int>(i)),
+                Containers::arrayCast<2, Float>(dst));
+            else if(type == SceneFieldType::Float)
+                Utility::copy(scene.field<Float>(i), dst);
+            else CORRADE_INTERNAL_ASSERT_UNREACHABLE(); /* LCOV_EXCL_LINE */
+
+            offset += size;
+        }
+
+        CORRADE_INTERNAL_ASSERT(offset == customFieldOffset);
+    }
+
     /* Go object by object and consume the fields, populating the glTF node
        array */
     // TODO gracefully fail if adding more than one scene
@@ -554,6 +641,9 @@ bool GltfSceneConverter::doAdd(const UnsignedInt id, const SceneData& scene, con
         if(childOffsets[j + 1] - childOffsets[j]) {
             _state->gltfNodes.writeKey("children").writeArray(children.slice(childOffsets[j], childOffsets[j + 1]));
         }
+
+        // TODO ensure that extra fields are always last so this works
+        bool extrasOpen = false;
 
         SceneField previous{};
         for(std::size_t i = objectFieldOffsets[j], iMax = objectFieldOffsets[j + 1]; i != iMax; ++i) {
@@ -604,9 +694,22 @@ bool GltfSceneConverter::doAdd(const UnsignedInt id, const SceneData& scene, con
                    here */
                 CORRADE_INTERNAL_ASSERT_UNREACHABLE();
             } else {
-                // TODO hmmmmmmmmmmmmmmmmmmmmmmmmmmm
+                CORRADE_INTERNAL_ASSERT(isSceneFieldCustom(name));
+
+                if(!extrasOpen) {
+                    _state->gltfNodes.writeKey("extras"_s).beginObject();
+                    extrasOpen = true;
+                }
+
+                // TODO yes ofc it goes to extras; LATER
+                const auto found = _state->sceneFieldNames.find(sceneFieldCustom(name));
+                CORRADE_INTERNAL_ASSERT(found != _state->sceneFieldNames.end());
+                _state->gltfNodes.writeKey(found->second).write(Double(customFields[offset]));
+                // TODO ugh the double is a BAD workaround, fix properly
             }
         }
+
+        if(extrasOpen) _state->gltfNodes.endObject();
 
         if(_state->objectNames.size() > j && _state->objectNames[j])
             _state->gltfNodes.writeKey("name").write(_state->objectNames[j]);
@@ -623,8 +726,9 @@ bool GltfSceneConverter::doAdd(const UnsignedInt id, const SceneData& scene, con
         _state->gltfScenes.writeKey("nodes").writeArray(children.prefix(childOffsets[0]));
     }
 
+    // TODO _s for all strings!!
     if(name)
-        _state->gltfScenes.writeKey("name").write(name);
+        _state->gltfScenes.writeKey("name"_s).write(name);
 
     return true;
 }
