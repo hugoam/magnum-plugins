@@ -208,6 +208,14 @@ struct GltfImporter::Document {
     };
     Containers::Array<Containers::Optional<Sampler>> samplers;
 
+    /* Textures without duplicates from KHR_texture_ktx that point to the same
+       image but have a different layer. IDs pointing to the gltfTextures
+       array. The second array has the same size as gltfTextures and maps from
+       the glTF texture ID (referenced by a material) to the unique ID. */
+    Containers::Array<UnsignedInt> uniqueTextures, uniqueTextureForGltfTexture;
+    /* Images separated by dimensions. IDs pointing to the gltfImages array. */
+    Containers::Array<UnsignedInt> images2D, images3D;
+
     /* We can use StringView as the map key here because all views point to
        strings stored inside Utility::Json which ensures the pointers are
        stable and won't go out of scope. */
@@ -220,7 +228,8 @@ struct GltfImporter::Document {
         nodesForName,
         meshesForName,
         materialsForName,
-        imagesForName,
+        images2DForName,
+        images3DForName,
         texturesForName;
 
     /* Unlike the ones above, these are filled already during construction as
@@ -784,7 +793,8 @@ void GltfImporter::doOpenData(Containers::Array<char>&& data, const DataFlags da
             e.g. ignoreRequiredExtension=KHR_materials_volume */
         const bool ignoreRequiredExtensions = configuration().value<bool>("ignoreRequiredExtensions");
 
-        constexpr Containers::StringView supportedExtensions[]{
+        Containers::Array<Containers::StringView> supportedExtensions;
+        arrayAppend(supportedExtensions, {
             "KHR_lights_punctual"_s,
             "KHR_materials_clearcoat"_s,
             "KHR_materials_pbrSpecularGlossiness"_s,
@@ -794,7 +804,9 @@ void GltfImporter::doOpenData(Containers::Array<char>&& data, const DataFlags da
             "KHR_texture_transform"_s,
             "GOOGLE_texture_basis"_s,
             "MSFT_texture_dds"_s
-        };
+        });
+        if(configuration().value<bool>("experimentalKhrTextureKtx"))
+            arrayAppend(supportedExtensions, "KHR_texture_ktx"_s);
 
         /* M*N loop should be okay here, extensionsRequired should usually have
            no or very few entries. Consider binary search if the list of
@@ -1134,6 +1146,73 @@ void GltfImporter::doOpenData(Containers::Array<char>&& data, const DataFlags da
                     arrayAppend(_d->meshAttributeNames, gltfAttribute.key());
             }
         }
+    }
+
+    /* Discover 2D array images -- if any KHR_texture_ktx texture extension
+       has a layer property, given image is 2D array. Otherwise it's 2D. */
+    {
+        /** @todo BitArray */
+        Containers::Array<bool> imageIs3D{ValueInit, _d->gltfImages.size()};
+        UnsignedInt previousSource = ~UnsignedInt{};
+        _d->uniqueTextureForGltfTexture = Containers::Array<UnsignedInt>{NoInit, _d->gltfTextures.size()};
+        for(UnsignedInt i = 0; i != _d->gltfTextures.size(); ++i) {
+            if(configuration().value<bool>("experimentalKhrTextureKtx")) if(const Utility::JsonToken* const gltfTextureExtensions = _d->gltfTextures[i].first()->find("extensions"_s)) {
+                if(!gltf->parseObject(*gltfTextureExtensions)) {
+                    Error{} << "Trade::GltfImporter::openData(): invalid extensions property in texture" << i;
+                    return;
+                }
+
+                if(const Utility::JsonToken* const gltfKhrTextureKtx = gltfTextureExtensions->find("KHR_texture_ktx"_s)) {
+                    if(!gltf->parseObject(*gltfKhrTextureKtx)) {
+                        Error{} << "Trade::GltfImporter::openData(): invalid KHR_texture_ktx extension property in texture" << i;
+                        return;
+                    }
+
+                    if(gltfKhrTextureKtx->find("layer")) {
+                        const Utility::JsonToken* const gltfSource = gltfKhrTextureKtx->find("source"_s);
+                        if(!gltfSource || !gltf->parseUnsignedInt(*gltfSource)) {
+                            Error{} << "Trade::GltfImporter::openData(): missing or invalid KHR_texture_ktx source property in texture" << i;
+                            return;
+                        }
+
+                        if(gltfSource->asUnsignedInt() >= _d->gltfImages.size()) {
+                            Error{} << "Trade::GltfImporter::openData(): index" << gltfSource->asUnsignedInt() << "out of range for" << _d->gltfImages.size() << "images";
+                            return;
+                        }
+
+                        imageIs3D[gltfSource->asUnsignedInt()] = true;
+
+                        /* If the texture has the same image ID as the previous
+                           one, assume it's the same texture. Otherwise treat
+                           it as a new texture. */
+                        /** @todo check also sampler params */
+                        // TODO test deduplication if not ordered, if more than
+                        //  one 3D texture etc
+                        if(previousSource != gltfSource->asUnsignedInt()) {
+                            arrayAppend(_d->uniqueTextures, i);
+                            previousSource = gltfSource->asUnsignedInt();
+                        }
+                        _d->uniqueTextureForGltfTexture[i] = _d->uniqueTextures.size() - 1;
+
+                        continue;
+                    }
+                }
+            }
+
+            /* If the texture doesn't have the KHR_texture_ktx extension or the
+               layer property or we don't have the experimental functionality
+               enabled, treat it as unique always */
+            _d->uniqueTextureForGltfTexture[i] = _d->uniqueTextures.size();
+            arrayAppend(_d->uniqueTextures, i);
+        }
+
+        /* Put the images into two separate list based on dimension for easier
+           lookup. Optimistically assume that most images are 2D. */
+        /** @todo reserve based on popcount; combine the allocations? or maybe
+            just partition gltfImages instead and store 2D count externally? */
+        arrayReserve(_d->images2D, _d->gltfImages.size());
+        for(UnsignedInt i = 0; i != imageIs3D.size(); ++i)
+            arrayAppend(imageIs3D[i] ? _d->images3D : _d->images2D, i);
     }
 
     /* Parse default scene, as we can't fail in doDefaultScene() */
@@ -3046,7 +3125,34 @@ bool GltfImporter::materialTexture(const Utility::JsonToken& gltfTexture, Contai
     }
     if(gltfIndex->asUnsignedInt() >= _d->gltfTextures.size()) {
         Error{} << "Trade::GltfImporter::material():" << gltfTexture.parent()->asString() << "index" << gltfIndex->asUnsignedInt() << "out of range for" << _d->gltfTextures.size() << "textures";
+        // TODO this is different than the reported texture count, make the message less confusing
         return false;
+    }
+    const UnsignedInt uniqueIndex = _d->uniqueTextureForGltfTexture[gltfIndex->asUnsignedInt()];
+
+    /* Add only if non-empty attribute */
+    // TODO clarify comment, test it's not added for metallic (rougness? or???)
+    //  texture
+    if(configuration().value<bool>("experimentalKhrTextureKtx") && attribute) {
+        const Utility::JsonToken* gltfTextureExtensions;
+        const Utility::JsonToken* gltfKhrTextureKtx;
+        const Utility::JsonToken* gltfTextureLayer;
+        if((gltfTextureExtensions = _d->gltfTextures[gltfIndex->asUnsignedInt()].first()->find("extensions"_s)) &&
+           (gltfKhrTextureKtx = gltfTextureExtensions->find("KHR_texture_ktx"_s)) &&
+           (gltfTextureLayer = gltfKhrTextureKtx->find("layer"_s)))
+        {
+            if(!_d->gltf->parseUnsignedInt(*gltfTextureLayer)) {
+                Error{} << "Trade::GltfImporter::material(): invalid KHR_texture_ktx layer property";
+                return false;
+            }
+
+            // TODO builtin layer attribute
+            // TODO pass it through the function params?!
+            Containers::String layerAttribute = attribute + "Layer"_s;
+            layerAttribute[0] = std::tolower(layerAttribute[0]);
+            if(checkMaterialAttributeSize(layerAttribute, MaterialAttributeType::UnsignedInt))
+                arrayAppend(attributes, InPlaceInit, layerAttribute, gltfTextureLayer->asUnsignedInt());
+        }
     }
 
     /* Texture coordinate is optional, defaulting to 0 */
@@ -3162,8 +3268,10 @@ bool GltfImporter::materialTexture(const Utility::JsonToken& gltfTexture, Contai
     /* In some cases (when dealing with packed textures), we're parsing &
        adding texture coordinates and matrix multiple times, but adding the
        packed texture ID just once. In other cases the attribute is invalid. */
+    // TODO yes this is the comment that should go above to the KHR_texture_ktx
+    //  TODO
     if(!attribute.isEmpty() && checkMaterialAttributeSize(attribute, MaterialAttributeType::UnsignedInt)) {
-        arrayAppend(attributes, InPlaceInit, attribute, gltfIndex->asUnsignedInt());
+        arrayAppend(attributes, InPlaceInit, attribute, uniqueIndex);
     }
 
     return true;
@@ -3757,15 +3865,15 @@ Containers::Optional<MaterialData> GltfImporter::doMaterial(const UnsignedInt id
 }
 
 UnsignedInt GltfImporter::doTextureCount() const {
-    return _d->gltfTextures.size();
+    return _d->uniqueTextures.size();
 }
 
 Int GltfImporter::doTextureForName(const Containers::StringView name) {
     if(!_d->texturesForName) {
         _d->texturesForName.emplace();
-        _d->texturesForName->reserve(_d->gltfTextures.size());
-        for(std::size_t i = 0; i != _d->gltfTextures.size(); ++i)
-            if(const Containers::StringView n = _d->gltfTextures[i].second())
+        _d->texturesForName->reserve(_d->uniqueTextures.size());
+        for(std::size_t i = 0; i != _d->uniqueTextures.size(); ++i)
+            if(const Containers::StringView n = _d->gltfTextures[_d->uniqueTextures[i]].second())
                 _d->texturesForName->emplace(n, i);
     }
 
@@ -3774,13 +3882,15 @@ Int GltfImporter::doTextureForName(const Containers::StringView name) {
 }
 
 Containers::String GltfImporter::doTextureName(const UnsignedInt id) {
-    return _d->gltfTextures[id].second();
+    return _d->gltfTextures[_d->uniqueTextures[id]].second();
 }
 
 Containers::Optional<TextureData> GltfImporter::doTexture(const UnsignedInt id) {
-    const Utility::JsonToken& gltfTexture = _d->gltfTextures[id].first();
+    const Utility::JsonToken& gltfTexture = _d->gltfTextures[_d->uniqueTextures[id]].first();
 
     const Utility::JsonToken* gltfSource = nullptr;
+
+    TextureType type = TextureType::Texture2D;
 
     /* Various extensions, they override the standard image. The core glTF spec
        only allows image/jpeg and image/png and these extend for other MIME
@@ -3801,7 +3911,16 @@ Containers::Optional<TextureData> GltfImporter::doTexture(const UnsignedInt id) 
         /* Pick the first extension we understand */
         for(const Utility::JsonObjectItem i: gltfExtensions->asObject()) {
             const Containers::StringView extensionName = i.key();
-            if(
+
+            /* KTX textures might be 2D arrays, update the type in that case */
+            if(configuration().value<bool>("experimentalKhrTextureKtx") && extensionName == "KHR_texture_ktx"_s) {
+                // TODO it should decide based on whether the referenced image
+                //  is 3D, not whether the layer property is present
+                if(i.value().find("layer"))
+                    type = TextureType::Texture2DArray;
+
+            /* The other recognized types are all 2D, which is the default */
+            } else if(
                 /* KHR_texture_basisu allows the usage of mimeType image/ktx2
                    but only explicitly talks about KTX2 with Basis compression.
                    We don't care . Note:  but we don't
@@ -3968,9 +4087,9 @@ Containers::Optional<TextureData> GltfImporter::doTexture(const UnsignedInt id) 
         }
     }
 
-    /* glTF supports only 2D textures */
-    return TextureData{TextureType::Texture2D,
-        minificationFilter, magnificationFilter,
+    return TextureData{type, minificationFilter, magnificationFilter,
+        // TODO is this the right texture? or maybe rather pass nullptr for
+        //  the deduplicated textures??
         mipmap, wrapping, gltfSource->asUnsignedInt(), &gltfTexture};
 }
 
@@ -4060,30 +4179,30 @@ AbstractImporter* GltfImporter::setupOrReuseImporterForImage(const char* const e
 }
 
 UnsignedInt GltfImporter::doImage2DCount() const {
-    return _d->gltfImages.size();
+    return _d->images2D.size();
 }
 
 Int GltfImporter::doImage2DForName(const Containers::StringView name) {
-    if(!_d->imagesForName) {
-        _d->imagesForName.emplace();
-        _d->imagesForName->reserve(_d->gltfImages.size());
-        for(std::size_t i = 0; i != _d->gltfImages.size(); ++i)
-            if(const Containers::StringView n = _d->gltfImages[i].second())
-                _d->imagesForName->emplace(n, i);
+    if(!_d->images2DForName) {
+        _d->images2DForName.emplace();
+        _d->images2DForName->reserve(_d->images2D.size());
+        for(std::size_t i = 0; i != _d->images2D.size(); ++i)
+            if(const Containers::StringView n = _d->gltfImages[_d->images2D[i]].second())
+                _d->images2DForName->emplace(n, i);
     }
 
-    const auto found = _d->imagesForName->find(name);
-    return found == _d->imagesForName->end() ? -1 : found->second;
+    const auto found = _d->images2DForName->find(name);
+    return found == _d->images2DForName->end() ? -1 : found->second;
 }
 
 Containers::String GltfImporter::doImage2DName(const UnsignedInt id) {
-    return _d->gltfImages[id].second();
+    return _d->gltfImages[_d->images2D[id]].second();
 }
 
 UnsignedInt GltfImporter::doImage2DLevelCount(const UnsignedInt id) {
     CORRADE_ASSERT(manager(), "Trade::GltfImporter::image2DLevelCount(): the plugin must be instantiated with access to plugin manager in order to open image files", {});
 
-    AbstractImporter* importer = setupOrReuseImporterForImage("Trade::GltfImporter::image2DLevelCount():", id);
+    AbstractImporter* importer = setupOrReuseImporterForImage("Trade::GltfImporter::image2DLevelCount():", _d->images2D[id]);
     /* image2DLevelCount() isn't supposed to fail (image2D() is, instead), so
        report 1 on failure and expect image2D() to fail later */
     if(!importer) return 1;
@@ -4094,7 +4213,7 @@ UnsignedInt GltfImporter::doImage2DLevelCount(const UnsignedInt id) {
 Containers::Optional<ImageData2D> GltfImporter::doImage2D(const UnsignedInt id, const UnsignedInt level) {
     CORRADE_ASSERT(manager(), "Trade::GltfImporter::image2D(): the plugin must be instantiated with access to plugin manager in order to load images", {});
 
-    AbstractImporter* importer = setupOrReuseImporterForImage("Trade::GltfImporter::image2D():", id);
+    AbstractImporter* importer = setupOrReuseImporterForImage("Trade::GltfImporter::image2D():", _d->images2D[id]);
     if(!importer) return {};
 
     /* Include a pointer to the glTF image in the result */
@@ -4105,6 +4224,47 @@ Containers::Optional<ImageData2D> GltfImporter::doImage2D(const UnsignedInt id, 
 
 const void* GltfImporter::doImporterState() const {
     return &*_d->gltf;
+}
+
+UnsignedInt GltfImporter::doImage3DCount() const {
+    return _d->images3D.size();
+}
+
+Int GltfImporter::doImage3DForName(const Containers::StringView name) {
+    if(!_d->images3DForName) {
+        _d->images3DForName.emplace();
+        _d->images3DForName->reserve(_d->images3D.size());
+        for(std::size_t i = 0; i != _d->images3D.size(); ++i)
+            if(const Containers::StringView name = _d->gltfImages[_d->images3D[i]].second())
+                _d->images3DForName->emplace(name, i);
+    }
+
+    const auto found = _d->images3DForName->find(name);
+    return found == _d->images3DForName->end() ? -1 : found->second;
+}
+
+Containers::String GltfImporter::doImage3DName(const UnsignedInt id) {
+    return _d->gltfImages[_d->images3D[id]].second();
+}
+
+UnsignedInt GltfImporter::doImage3DLevelCount(const UnsignedInt id) {
+    CORRADE_ASSERT(manager(), "Trade::GltfImporter::image3DLevelCount(): the plugin must be instantiated with access to plugin manager in order to open image files", {});
+
+    AbstractImporter* importer = setupOrReuseImporterForImage("Trade::GltfImporter::image3DLevelCount():", _d->images3D[id]);
+    /* image2DLevelCount() isn't supposed to fail (image2D() is, instead), so
+       report 1 on failure and expect image2D() to fail later */
+    if(!importer) return 1;
+
+    return importer->image3DLevelCount(0);
+}
+
+Containers::Optional<ImageData3D> GltfImporter::doImage3D(const UnsignedInt id, const UnsignedInt level) {
+    CORRADE_ASSERT(manager(), "Trade::GltfImporter::image3D(): the plugin must be instantiated with access to plugin manager in order to load images", {});
+
+    AbstractImporter* importer = setupOrReuseImporterForImage("Trade::GltfImporter::image3D():", _d->images3D[id]);
+    if(!importer) return {};
+
+    return importer->image3D(0, level);
 }
 
 }}

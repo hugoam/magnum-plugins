@@ -555,6 +555,12 @@ class MAGNUM_GLTFIMPORTER_EXPORT GltfImporter: public AbstractImporter {
         MAGNUM_GLTFIMPORTER_LOCAL Containers::String doImage2DName(UnsignedInt id) override;
         MAGNUM_GLTFIMPORTER_LOCAL Containers::Optional<ImageData2D> doImage2D(UnsignedInt id, UnsignedInt level) override;
 
+        MAGNUM_GLTFIMPORTER_LOCAL UnsignedInt doImage3DCount() const override;
+        MAGNUM_GLTFIMPORTER_LOCAL UnsignedInt doImage3DLevelCount(UnsignedInt id) override;
+        MAGNUM_GLTFIMPORTER_LOCAL Int doImage3DForName(Containers::StringView name) override;
+        MAGNUM_GLTFIMPORTER_LOCAL Containers::String doImage3DName(UnsignedInt id) override;
+        MAGNUM_GLTFIMPORTER_LOCAL Containers::Optional<ImageData3D> doImage3D(UnsignedInt id, UnsignedInt level) override;
+
         MAGNUM_GLTFIMPORTER_LOCAL Containers::Optional<Containers::Array<char>> loadUri(const char* errorPrefix, Containers::StringView uri);
         MAGNUM_GLTFIMPORTER_LOCAL Containers::Optional<Containers::ArrayView<const char>> parseBuffer(const char* const errorPrefix, UnsignedInt id);
         MAGNUM_GLTFIMPORTER_LOCAL Containers::Optional<Containers::Triple<Containers::ArrayView<const char>, UnsignedInt, UnsignedInt>> parseBufferView(const char* errorPrefix, UnsignedInt bufferViewId);
