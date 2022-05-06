@@ -144,6 +144,9 @@ to edit the configuration values.
 */
 class MAGNUM_KTXIMAGECONVERTER_EXPORT KtxImageConverter: public AbstractImageConverter {
     public:
+        // TODO remove
+        explicit KtxImageConverter();
+
         /** @brief Plugin manager constructor */
         explicit KtxImageConverter(PluginManager::AbstractManager& manager, const Containers::StringView& plugin);
 

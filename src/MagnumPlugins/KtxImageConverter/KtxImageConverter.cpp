@@ -916,6 +916,9 @@ template<UnsignedInt dimensions, template<UnsignedInt, typename> class View> Con
 
 }
 
+// TODO ugh remove, this is not the way
+KtxImageConverter::KtxImageConverter() {}
+
 KtxImageConverter::KtxImageConverter(PluginManager::AbstractManager& manager, const Containers::StringView& plugin): AbstractImageConverter{manager, plugin} {}
 
 ImageConverterFeatures KtxImageConverter::doFeatures() const {

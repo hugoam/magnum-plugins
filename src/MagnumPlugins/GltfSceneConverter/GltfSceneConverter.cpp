@@ -43,11 +43,16 @@
 #include <Magnum/Math/PackingBatch.h>
 #include <Magnum/Math/Quaternion.h>
 #include <Magnum/Trade/ArrayAllocator.h>
+#include <Magnum/Trade/ImageData.h>
 #include <Magnum/Trade/MaterialData.h>
 #include <Magnum/Trade/MeshData.h>
 #include <Magnum/Trade/SceneData.h>
+#include <Magnum/Trade/TextureData.h>
 
 #include "MagnumPlugins/GltfImporter/Gltf.h"
+
+// TODO drop, use the plugin manager interface instead
+#include "MagnumPlugins/KtxImageConverter/KtxImageConverter.h"
 
 /* We'd have to endian-flip everything that goes into buffers, plus the binary
    glTF headers, etc. Too much work, hard to automatically test because the
@@ -76,6 +81,7 @@ struct GltfSceneConverter::State {
 
     /* Extensions required based on data added */
     bool requireKhrMeshQuantization = false;
+    bool requireKhrTextureKtx = false;
 
     Utility::JsonWriter gltfBuffers;
     Utility::JsonWriter gltfBufferViews;
@@ -84,6 +90,13 @@ struct GltfSceneConverter::State {
     Utility::JsonWriter gltfNodes;
     Utility::JsonWriter gltfScenes;
     Utility::JsonWriter gltfMaterials;
+    Utility::JsonWriter gltfTextures;
+    Utility::JsonWriter gltfImages;
+
+    Containers::Array<UnsignedInt> image3DLayerCount;
+    // TODO for a texture i referenced by the original material says how much
+    //  is it duplicated due to layer count
+    Containers::Array<UnsignedInt> textureIdOffsets{InPlaceInit, {0}};
 
     Containers::Array<char> buffer;
 };
@@ -98,6 +111,9 @@ SceneConverterFeatures GltfSceneConverter::doFeatures() const {
     return SceneConverterFeature::ConvertMultipleToData|
            SceneConverterFeature::AddMeshes|
            SceneConverterFeature::AddMaterials|
+           SceneConverterFeature::AddTextures|
+           SceneConverterFeature::AddImages3D|
+           SceneConverterFeature::AddCompressedImages3D|
            SceneConverterFeature::AddScenes;
 }
 
@@ -143,7 +159,9 @@ void GltfSceneConverter::doBeginData() {
             &_state->gltfMeshes,
             &_state->gltfNodes,
             &_state->gltfScenes,
-            &_state->gltfMaterials
+            &_state->gltfMaterials,
+            &_state->gltfTextures,
+            &_state->gltfImages
         })
             *writer = Utility::JsonWriter{_state->jsonOptions, _state->jsonIndentation, _state->jsonIndentation*1};
     }
@@ -182,6 +200,12 @@ Containers::Optional<Containers::Array<char>> GltfSceneConverter::doEndData() {
                 extensionsUsed.push_back("KHR_mesh_quantization"_s);
             if(!contains(extensionsRequired, "KHR_mesh_quantization"_s))
                 extensionsRequired.push_back("KHR_mesh_quantization"_s);
+        }
+        if(_state->requireKhrTextureKtx) {
+            if(!contains(extensionsUsed, "KHR_texture_ktx"_s))
+                extensionsUsed.push_back("KHR_texture_ktx"_s);
+            if(!contains(extensionsRequired, "KHR_texture_ktx"_s))
+                extensionsRequired.push_back("KHR_texture_ktx"_s);
         }
 
         if(!extensionsUsed.empty()) {
@@ -231,6 +255,10 @@ Containers::Optional<Containers::Array<char>> GltfSceneConverter::doEndData() {
         json.writeKey("bufferViews").writeJson(_state->gltfBufferViews.endArray().toString());
     if(!_state->gltfAccessors.isEmpty())
         json.writeKey("accessors").writeJson(_state->gltfAccessors.endArray().toString());
+    if(!_state->gltfImages.isEmpty())
+        json.writeKey("images").writeJson(_state->gltfImages.endArray().toString());
+    if(!_state->gltfTextures.isEmpty())
+        json.writeKey("textures").writeJson(_state->gltfTextures.endArray().toString());
     if(!_state->gltfMaterials.isEmpty())
         json.writeKey("materials").writeJson(_state->gltfMaterials.endArray().toString());
     if(!_state->gltfMeshes.isEmpty())
@@ -1237,9 +1265,19 @@ bool GltfSceneConverter::doAdd(UnsignedInt, const MaterialData& material, const 
         }
         // TODO ffs where's findAttributeId()?!
         if(material.hasAttribute(MaterialAttribute::BaseColorTexture)) {
+            UnsignedInt texture = material.attribute<UnsignedInt>(MaterialAttribute::BaseColorTexture);
+            if(texture >= _state->textureIdOffsets.size()) {
+                Error{} << "Trade::GltfSceneConverter::add(): material references texture" << texture << "but only" << _state->textureIdOffsets.size() << "were added so far";
+                return {};
+            }
+
+            UnsignedInt layer = 0;
+            if(material.hasAttribute("baseColorTextureLayer"_s))
+                layer = material.attribute<UnsignedInt>("baseColorTextureLayer"_s);
+
             _state->gltfMaterials.writeKey("baseColorTexture"_s)
                 .beginObject()
-                    .writeKey("index"_s).write(material.attribute<UnsignedInt>(MaterialAttribute::BaseColorTexture))
+                    .writeKey("index"_s).write(_state->textureIdOffsets[texture] + layer)
                 .endObject();
         }
     }
@@ -1251,7 +1289,87 @@ bool GltfSceneConverter::doAdd(UnsignedInt, const MaterialData& material, const 
             .endObject();
 
     if(name)
-        _state->gltfMaterials.writeKey("name").write(name);
+        _state->gltfMaterials.writeKey("name"_s).write(name);
+
+    return true;
+}
+
+bool GltfSceneConverter::doAdd(const UnsignedInt id, const TextureData& texture, const Containers::StringView name) {
+    /* If this is a first image, open the images array */
+    if(_state->gltfTextures.isEmpty())
+        _state->gltfTextures.beginArray();
+
+    if(texture.type() != TextureType::Texture2DArray) {
+        Error{} << "Trade::GltfSceneConverter::add(): expected a 2D array texture, got" << texture.type();
+        return {};
+    }
+
+    if(texture.image() >= _state->image3DLayerCount.size()) {
+        Error{} << "Trade::GltfSceneConverter::add(): texture references image" << texture.image() << "but only" << _state->image3DLayerCount.size() << "were added so far";
+        return {};
+    }
+
+    _state->requireKhrTextureKtx = true;
+
+    /* Add one texture for every layer */
+    // TODO defer and skip ones that aren't referenced by any material?
+    const UnsignedInt layerCount = _state->image3DLayerCount[texture.image()];
+    for(UnsignedInt layer = 0; layer != layerCount; ++layer) {
+        _state->gltfTextures.beginObject()
+            .writeKey("extensions"_s).beginObject()
+                .writeKey("KHR_texture_ktx"_s).beginObject()
+                    .writeKey("source"_s).write(texture.image())
+                    .writeKey("layer"_s).write(layer)
+                .endObject()
+            .endObject()
+        .endObject();
+    }
+
+    // TODO need to test this with more than 1 3D image
+    CORRADE_INTERNAL_ASSERT(_state->textureIdOffsets.size() == id + 1);
+    arrayAppend(_state->textureIdOffsets, _state->textureIdOffsets.back() + layerCount);
+
+    if(name)
+        _state->gltfImages.writeKey("texture"_s).write(name);
+
+    return true;
+}
+
+bool GltfSceneConverter::doAdd(const UnsignedInt id, const ImageData3D& image, const Containers::StringView name) {
+    /* If this is a first image, open the images array */
+    if(_state->gltfImages.isEmpty())
+        _state->gltfImages.beginArray();
+
+    // TODO should maybe verify that it's indeed a 2D array image, once we have
+    //  flags
+
+    /* Remember layer count for the texture later */
+    CORRADE_INTERNAL_ASSERT(_state->image3DLayerCount.size() == id);
+    arrayAppend(_state->image3DLayerCount, image.size().z());
+
+    Containers::ScopeGuard gltfImage = _state->gltfImages.beginObjectScope();
+
+    if(!_state->filename) {
+        // TODO acutally provide a functionality for internal images
+        Error{} << "Trade::GltfSceneConverter::add(): can only write a glTF with external images if converting to a file";
+        return {};
+    }
+
+    const Containers::String imageFilename = Utility::format("{}.{}.{}",
+        Utility::Path::splitExtension(*_state->filename).first(),
+        id,
+        configuration().value<Containers::StringView>("imageExtension"));
+
+    KtxImageConverter converter;
+    if(!converter.convertToFile(image, imageFilename)) {
+        Error{} << "Trade::GltfSceneConverter::add(): can't save an image";
+        return {};
+    }
+
+    _state->gltfImages.writeKey("uri"_s).write(imageFilename);
+
+    if(name)
+        _state->gltfImages.writeKey("name"_s).write(name);
 
     return true;
 }
