@@ -520,6 +520,8 @@ class MAGNUM_GLTFIMPORTER_EXPORT GltfImporter: public AbstractImporter {
         MAGNUM_GLTFIMPORTER_LOCAL Int doSceneForName(Containers::StringView name) override;
         MAGNUM_GLTFIMPORTER_LOCAL Containers::String doSceneName(UnsignedInt id) override;
         MAGNUM_GLTFIMPORTER_LOCAL Containers::Optional<SceneData> doScene(UnsignedInt id) override;
+        MAGNUM_GLTFIMPORTER_LOCAL SceneField doSceneFieldForName(Containers::StringView name) override;
+        MAGNUM_GLTFIMPORTER_LOCAL Containers::String doSceneFieldName(UnsignedInt name) override;
 
         MAGNUM_GLTFIMPORTER_LOCAL UnsignedLong doObjectCount() const override;
         MAGNUM_GLTFIMPORTER_LOCAL Long doObjectForName(Containers::StringView name) override;
