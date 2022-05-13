@@ -182,3 +182,7 @@ endif()
 if(WITH_TINYGLTFIMPORTER)
     add_subdirectory(TinyGltfImporter)
 endif()
+
+if(WITH_URDFIMPORTER)
+    add_subdirectory(UrdfImporter)
+endif()
