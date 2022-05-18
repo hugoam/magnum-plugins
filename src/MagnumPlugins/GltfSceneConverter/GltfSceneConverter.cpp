@@ -1361,6 +1361,7 @@ bool GltfSceneConverter::doAdd(const UnsignedInt id, const ImageData3D& image, c
         configuration().value<Containers::StringView>("imageExtension"));
 
     KtxImageConverter converter;
+    converter.configuration().setValue("orientation", "rui"); // TODO WAS
     if(!converter.convertToFile(image, imageFilename)) {
         Error{} << "Trade::GltfSceneConverter::add(): can't save an image";
         return {};
