@@ -39,6 +39,7 @@
 #include <Corrade/Utility/Path.h>
 #include <Corrade/Utility/String.h>
 #include <Magnum/Math/Color.h>
+#include <Magnum/Math/Matrix3.h>
 #include <Magnum/Math/Matrix4.h>
 #include <Magnum/Math/PackingBatch.h>
 #include <Magnum/Math/Quaternion.h>
@@ -1275,10 +1276,24 @@ bool GltfSceneConverter::doAdd(UnsignedInt, const MaterialData& material, const 
             if(material.hasAttribute("baseColorTextureLayer"_s))
                 layer = material.attribute<UnsignedInt>("baseColorTextureLayer"_s);
 
-            _state->gltfMaterials.writeKey("baseColorTexture"_s)
-                .beginObject()
-                    .writeKey("index"_s).write(_state->textureIdOffsets[texture] + layer)
-                .endObject();
+            _state->gltfMaterials.writeKey("baseColorTexture"_s).beginObject()
+                .writeKey("index"_s).write(_state->textureIdOffsets[texture] + layer);
+
+            if(material.hasAttribute(MaterialAttribute::BaseColorTextureMatrix)) {
+                // TODO more than just scaling
+                const Vector2 scaling = material.attribute<Matrix3>(MaterialAttribute::BaseColorTextureMatrix).scaling();
+                _state->gltfMaterials.writeKey("extensions"_s)
+                    .beginObject()
+                        .writeKey("KHR_texture_transform"_s).beginObject()
+                            .writeKey("scale"_s).writeArray(scaling.data())
+                            /* glTFs origin is upper left so we have to offset
+                               in Y to scale from bottom */
+                            .writeKey("offset"_s).writeArray({0.0f, 1.0f - scaling.y()})
+                        .endObject()
+                    .endObject();
+            }
+
+            _state->gltfMaterials.endObject();
         }
     }
 
