@@ -2237,7 +2237,8 @@ Containers::Optional<SceneData> GltfImporter::doScene(UnsignedInt id) {
             if(gltfExtras->type() == Utility::JsonToken::Type::Object) for(const Utility::JsonObjectItem gltfExtra: gltfExtras->asObject()) {
                 if(gltfExtra.value().type() == Utility::JsonToken::Type::Number) {
                     // TODO ffs need a way to override not just scalar vs vector but also type (8M too small for index offsets)
-                    if(!_d->gltf->parseFloat(gltfExtra.value())) {
+                    // TODO doubles too wasteful
+                    if(!_d->gltf->parseDouble(gltfExtra.value())) {
                         Warning{} << "Trade::GltfImporter::scene(): invalid node" << i << "extras" << gltfExtra.key() << "property, skipping";
                         continue;
                     }
@@ -2285,7 +2286,7 @@ Containers::Optional<SceneData> GltfImporter::doScene(UnsignedInt id) {
     Containers::ArrayView<UnsignedInt> skinObjects;
     Containers::ArrayView<UnsignedInt> skins;
     Containers::ArrayView<UnsignedInt> extraObjects;
-    Containers::ArrayView<Float> extras;
+    Containers::ArrayView<Double> extras;
     Containers::Array<char> data = Containers::ArrayTuple{
         {NoInit, objects.size(), parentImporterStateObjects},
         {NoInit, objects.size(), parents},
@@ -2468,8 +2469,8 @@ Containers::Optional<SceneData> GltfImporter::doScene(UnsignedInt id) {
                        they'll be shifted by 0 for the final SceneFieldData
                        population */
                     UnsignedInt& extraOffset = extraOffsets[sceneFieldCustom(_d->sceneFieldsForName.at(gltfExtra.key())) + 1];
-                    extraObjects[extraOffset] = i;
-                    extras[extraOffset] = gltfExtra.value().asFloat();
+                    extraObjects[extraOffset] = objects[i];
+                    extras[extraOffset] = gltfExtra.value().asDouble();
                     ++extraOffset;
                 }
             }
