@@ -147,10 +147,19 @@ Containers::Optional<ImageData2D> PngImporter::doImage2D(UnsignedInt, UnsignedIn
                 bits = 8;
             }
 
+            png_set_gray_to_rgb(file);
+            channels = 3;
+            colorType = PNG_COLOR_TYPE_RGB;
+
             break;
 
         case PNG_COLOR_TYPE_GRAY_ALPHA:
             CORRADE_INTERNAL_ASSERT(channels == 2);
+
+            png_set_gray_to_rgb(file);
+            channels = 4;
+            colorType = PNG_COLOR_TYPE_RGBA;
+
             break;
 
         case PNG_COLOR_TYPE_RGB:
